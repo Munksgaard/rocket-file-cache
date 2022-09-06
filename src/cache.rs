@@ -87,7 +87,9 @@ impl Cache {
     ///
     /// ```
     /// #![feature(attr_literals)]
-    /// #![feature(custom_attribute)]
+    /// #![feature(decl_macro)]
+    ///
+    /// #[macro_use]
     /// # extern crate rocket;
     /// # extern crate rocket_file_cache;
     ///
