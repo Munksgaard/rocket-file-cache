@@ -4,6 +4,7 @@ version = "1.0.0"
 authors = ["Henry Zimmerman <zimhen7@gmail.com>"]
 exclude = [
 ]
+edition = "2018"
 
 
 
@@ -24,9 +25,11 @@ license = "MIT"
 maintenance = {status = "passively-maintained"}
 
 [dependencies]
-rocket = "0.4"
+rocket = "0.5.0-rc.2"
 log = "0.4.6"
 concurrent-hashmap = { git = "https://github.com/munksgaard/rust-concurrent-hashmap", rev = "1235da7fc89f6dfa3fc14f5ade209771b5632937" }
+tokio = { version = "1", features = [ "io-util", "fs", "rt", "macros" ] }
+async-recursion = "1.0.0"
 
 [dev-dependencies]
 tempdir = "0.3.7"

@@ -1,6 +1,6 @@
-use cache::Cache;
+use crate::cache::Cache;
 
-use priority_function::default_priority_function;
+use crate::priority_function::default_priority_function;
 use std::usize;
 
 use concurrent_hashmap::{ConcHashMap, Options};

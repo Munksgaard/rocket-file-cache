@@ -1,10 +1,11 @@
 use rocket::http::Status;
-use rocket::response::{Response, Responder, NamedFile};
+use rocket::response::{Response, Responder};
+use rocket::fs::NamedFile;
 use rocket::request::Request;
-use cache::Cache;
+use crate::cache::Cache;
 use std::path::Path;
 
-use named_in_memory_file::NamedInMemoryFile;
+use crate::named_in_memory_file::NamedInMemoryFile;
 
 
 /// Wrapper around data that can represent a file - either in memory (cache), or on disk.
@@ -29,8 +30,8 @@ impl<'a> CachedFile<'a> {
     ///
     /// This is done to keep the code required to use the cache as similar to the typical use of
     /// rocket::response::NamedFile.
-    pub fn open<P: AsRef<Path>>(path: P, cache: &'a Cache) -> CachedFile<'a> {
-        cache.get(path)
+    pub async fn open<P: AsRef<Path> + std::marker::Send>(path: P, cache: &'a Cache) -> CachedFile<'a> {
+        cache.get(path).await
     }
 }
 
@@ -47,8 +48,8 @@ impl From<NamedFile> for CachedFile<'static> {
     }
 }
 
-impl<'a> Responder<'a> for CachedFile<'a> {
-    fn respond_to(self, request: &Request) -> Result<Response<'a>, Status> {
+impl<'a> Responder<'a, 'a> for CachedFile<'a> {
+    fn respond_to(self, request: &'a Request) -> Result<Response<'a>, Status> {
 
         match self {
             CachedFile::InMemory(cached_file) => cached_file.respond_to(request),

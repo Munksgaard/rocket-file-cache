@@ -1,17 +1,18 @@
 use std::path::{PathBuf, Path};
 use std::usize;
-use rocket::response::NamedFile;
+use rocket::fs::NamedFile;
 use std::fs::Metadata;
 use std::fs;
-use named_in_memory_file::NamedInMemoryFile;
-use cached_file::CachedFile;
-use in_memory_file::InMemoryFile;
+use crate::named_in_memory_file::NamedInMemoryFile;
+use crate::cached_file::CachedFile;
+use crate::in_memory_file::InMemoryFile;
 use concurrent_hashmap::ConcHashMap;
 use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
 use std::fmt;
 use std::fmt::Formatter;
-use in_memory_file::FileStats;
+use crate::in_memory_file::FileStats;
+use async_recursion::async_recursion;
 
 #[derive(Debug, PartialEq)]
 enum CacheError {
@@ -86,14 +87,14 @@ impl Cache {
     /// # Example
     ///
     /// ```
-    /// #![feature(attr_literals)]
     /// #![feature(decl_macro)]
     ///
     /// #[macro_use]
     /// # extern crate rocket;
     /// # extern crate rocket_file_cache;
     ///
-    /// # fn main() {
+    /// #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
     /// use rocket_file_cache::{Cache, CachedFile};
     /// use std::path::{Path, PathBuf};
     /// use rocket::State;
@@ -102,13 +103,13 @@ impl Cache {
     ///
     ///
     /// #[get("/<file..>")]
-    /// fn files<'a>(file: PathBuf,  cache: State<'a, Cache> ) -> CachedFile<'a> {
+    /// async fn files<'a>(file: PathBuf,  cache: &'a State<Cache> ) -> CachedFile<'a> {
     ///     let path: PathBuf = Path::new("www/").join(file).to_owned();
-    ///     cache.inner().get(path)
+    ///     cache.inner().get(path).await
     /// }
     /// # }
     /// ```
-    pub fn get<P: AsRef<Path>>(&self, path: P) -> CachedFile {
+    pub async fn get<P: AsRef<Path> + std::marker::Send>(&self, path: P) -> CachedFile {
         trace!("{:#?}", self);
         // First, try to get the file in the cache that corresponds to the desired path.
 
@@ -125,18 +126,19 @@ impl Cache {
                         // If the access count is a multiple of the refresh parameter, then refresh the file.
                         if access_count % accesses_per_refresh == 0 {
                             debug!( "Refreshing entry for path: {:?}", path.as_ref() );
-                            return self.refresh(path.as_ref())
+                            return self.refresh(path.as_ref()).await
                         }
                     }
                     None => warn!("Cache contains entry for {:?}, but does not tract its access counts.", path.as_ref())
                 }
             }
 
+            self.get_from_cache(&path).await
+
         } else {
-            return self.try_insert(path);
+            self.try_insert(path).await
         }
 
-        self.get_from_cache(&path)
     }
 
 
@@ -156,7 +158,7 @@ impl Cache {
     /// The CachedFile will indicate NotFound if the file isn't already in the cache or if it can't
     /// be found in the filesystem.
     /// It will otherwise return a CachedFile::InMemory variant.
-    pub fn refresh<P: AsRef<Path>>(&self, path: P) -> CachedFile {
+    pub async fn refresh<P: AsRef<Path>>(&self, path: P) -> CachedFile {
 
         let mut is_ok_to_refresh: bool = false;
 
@@ -178,7 +180,7 @@ impl Cache {
         }
 
         if is_ok_to_refresh {
-            if let Ok(new_file) = InMemoryFile::open(path.as_ref().to_path_buf()) {
+            if let Ok(new_file) = InMemoryFile::open(path.as_ref().to_path_buf()).await {
                 debug!("Refreshing file: {:?}", path.as_ref());
                 {
                     self.file_map.remove(&path.as_ref().to_path_buf());
@@ -186,7 +188,7 @@ impl Cache {
                 }
                 self.update_stats(&path);
 
-                return self.get_from_cache(path)
+                return self.get_from_cache(path).await
             }
         }
 
@@ -379,7 +381,8 @@ impl Cache {
     /// look up the location of the file in the filesystem if the file is not in the cache.
     ///
     ///
-    fn try_insert<P: AsRef<Path>>(&self, path: P) -> CachedFile {
+    #[async_recursion]
+    async fn try_insert<P: AsRef<Path> + std::marker::Send>(&self, path: P) -> CachedFile {
         let path: PathBuf = path.as_ref().to_path_buf();
         trace!("Trying to insert file {:?}", path);
 
@@ -396,9 +399,9 @@ impl Cache {
 
 
         if size > self.max_file_size || size < self.min_file_size {
-            self.get_file_from_fs(&path)
+            self.get_file_from_fs(&path).await
         } else if required_space_for_new_file < 0 && size < self.size_limit {
-            self.get_file_from_fs_and_add_to_cache(&path)
+            self.get_file_from_fs_and_add_to_cache(&path).await
         } else {
             debug!("Trying to make room for the file");
 
@@ -421,7 +424,7 @@ impl Cache {
             match self.make_room_for_new_file(required_space_for_new_file as usize, new_file_priority) {
                 Ok(files_to_be_removed) => {
                     debug!("Made room for new file");
-                    match InMemoryFile::open(path.as_path()) {
+                    match InMemoryFile::open(path.as_path()).await {
                         Ok(file) => {
 
                             // We have read a new file into memory, it is safe to
@@ -455,7 +458,7 @@ impl Cache {
                                     // with the exact same timing required to invalidate the `find()` method,
                                     // for as many times as it takes to fill up the stack. It's not
                                     // going to happen.
-                                    return self.try_insert(path);
+                                    return self.try_insert(path).await;
                                 }
                             };
 
@@ -474,7 +477,7 @@ impl Cache {
                     // The new file would not be accepted by the cache, so instead of reading the whole file
                     // into memory, and then copying it yet again when it is attached to the body of the
                     // response, use a NamedFile instead.
-                    match NamedFile::open(path.clone()) {
+                    match NamedFile::open(path.clone()).await {
                         Ok(named_file) => CachedFile::from(named_file),
                         Err(_) => CachedFile::NotFound,
                     }
@@ -486,9 +489,9 @@ impl Cache {
     /// Gets a file from the filesystem and converts it to a CachedFile.
     ///
     /// This should be used when the cache knows that the new file won't make it into the cache.
-    fn get_file_from_fs< P: AsRef<Path>>(&self, path: P) -> CachedFile{
+    async fn get_file_from_fs< P: AsRef<Path>>(&self, path: P) -> CachedFile{
         debug!("File does not fit size constraints of the cache.");
-        match NamedFile::open(path.as_ref().to_path_buf()) {
+        match NamedFile::open(path.as_ref().to_path_buf()).await {
             Ok(named_file) => {
                 self.increment_access_count(path);
                 return CachedFile::from(named_file);
@@ -501,9 +504,10 @@ impl Cache {
     ///
     /// This is the slowest operation the cache can perform, slower than just getting the file.
     /// It should only be used when the cache decides to store the file.
-    fn get_file_from_fs_and_add_to_cache<P: AsRef<Path>>(&self, path: P) -> CachedFile {
+    #[async_recursion]
+    async fn get_file_from_fs_and_add_to_cache<P: AsRef<Path> + std::marker::Send + std::marker::Sync>(&self, path: P) -> CachedFile {
         debug!("Cache has room for the file.");
-        match InMemoryFile::open(&path) {
+        match InMemoryFile::open(&path).await {
             Ok(file) => {
                 self.file_map.insert(path.as_ref().to_path_buf(), file);
 
@@ -520,7 +524,7 @@ impl Cache {
                         // Because this recursion only occurs under extremely rare circumstances
                         // due to a concurrent removal of the file being added between the insertion
                         // into the map, and locking an accessor, a stack overflow is almost impossible.
-                        return self.get_file_from_fs_and_add_to_cache(path);
+                        return self.get_file_from_fs_and_add_to_cache(path).await;
                     }
                 };
 
@@ -580,7 +584,7 @@ impl Cache {
     }
 
     ///Helper function that gets the file from the cache if it exists there.
-    fn get_from_cache<P: AsRef<Path>>(&self, path: P) -> CachedFile {
+    async fn get_from_cache<P: AsRef<Path>>(&self, path: P) -> CachedFile {
         match self.file_map.find(&path.as_ref().to_path_buf()) {
             Some(in_memory_file) => {
                 trace!("Found file: {:?} in cache.", path.as_ref());
@@ -684,18 +688,18 @@ mod tests {
     use self::tempdir::TempDir;
     use self::test::Bencher;
     use self::rand::rngs::StdRng;
-    use std::io::{Write, BufWriter};
-    use std::fs::File;
-    use rocket::response::NamedFile;
-    use std::io::Read;
-    use in_memory_file::InMemoryFile;
+    use tokio::io::{AsyncWrite, BufWriter};
+    use tokio::fs::File;
+    use rocket::fs::NamedFile;
+    use tokio::io::AsyncRead;
+    use crate::in_memory_file::InMemoryFile;
     use concurrent_hashmap::Accessor;
     use std::sync::Arc;
     use std::mem;
-    use cache_builder::CacheBuilder;
+    use crate::cache_builder::CacheBuilder;
     use self::rand::FromEntropy;
     use self::rand::RngCore;
-
+    use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
     const MEG1: usize = 1024 * 1024;
     const MEG2: usize = MEG1 * 2;
@@ -709,30 +713,33 @@ mod tests {
     const FILE_MEG10: &'static str = "meg10.txt";
 
     // Helper function that creates test files in a directory that is cleaned up after the test runs.
-    fn create_test_file(temp_dir: &TempDir, size: usize, name: &str) -> PathBuf {
+    async fn create_test_file(temp_dir: &TempDir, size: usize, name: &str) -> PathBuf {
         let path = temp_dir.path().join(name);
-        let tmp_file = File::create(path.clone()).unwrap();
+        let mut tmp_file = File::create(path.clone()).await.unwrap();
         let mut rand_data: Vec<u8> = vec![0u8; size];
         StdRng::from_entropy().fill_bytes(rand_data.as_mut());
-        let mut buffer = BufWriter::new(tmp_file);
-        buffer.write(&rand_data).unwrap();
+        tmp_file.write_all(&rand_data).await.unwrap();
+        // let mut buffer = BufWriter::new(tmp_file);
+        // let x: usize = buffer.write(&rand_data).await.unwrap();
+        // buffer.flush().await.unwrap();
+        // assert_eq!(x, size);
         path
     }
 
 
     // Standardize the way a file is used in these tests.
     impl<'a> CachedFile<'a> {
-        fn dummy_write(self) {
+        async fn dummy_write(self) {
             match self {
                 CachedFile::InMemory(cached_file) => unsafe {
                     let file: *const Accessor<'a, PathBuf, InMemoryFile> = Arc::into_raw(cached_file.file);
                     let mut v: Vec<u8> = Vec::new();
-                    let _ = (*file).get().bytes.as_slice().read_to_end(&mut v).unwrap();
+                    let _ = (*file).get().bytes.as_slice().read_to_end(&mut v).await.unwrap();
                     let _ = Arc::from_raw(file); // To prevent a memory leak, an Arc needs to be reconstructed from the raw pointer.
                 },
                 CachedFile::FileSystem(mut named_file) => {
                     let mut v: Vec<u8> = Vec::new();
-                    let _ = named_file.read_to_end(&mut v).unwrap();
+                    let _ = named_file.read_to_end(&mut v).await.unwrap();
                 }
                 CachedFile::NotFound => {
                     panic!("tried to write using a non-existent file")
@@ -756,265 +763,265 @@ mod tests {
         }
     }
 
-    #[bench]
-    fn cache_get_10mb(b: &mut Bencher) {
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(MEG1 * 20)
-            .build()
-            .unwrap();
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
-        cache.get(&path_10m); // add the 10 mb file to the cache
+    // #[bench]
+    // fn cache_get_10mb(b: &mut Bencher) {
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(MEG1 * 20)
+    //         .build()
+    //         .unwrap();
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
+    //     cache.get(&path_10m); // add the 10 mb file to the cache
 
-        b.iter(|| {
-            let cached_file = cache.get(&path_10m);
-            cached_file.dummy_write()
-        });
-    }
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_10m);
+    //         cached_file.await.dummy_write()
+    //     });
+    // }
 
-    #[bench]
-    fn cache_miss_10mb(b: &mut Bencher) {
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(0)
-            .build()
-            .unwrap();
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
+    // #[bench]
+    // fn cache_miss_10mb(b: &mut Bencher) {
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(0)
+    //         .build()
+    //         .unwrap();
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
 
-        b.iter(|| {
-            let cached_file = cache.get(&path_10m);
-            cached_file.dummy_write()
-        });
-    }
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_10m);
+    //         cached_file.dummy_write()
+    //     });
+    // }
 
-    #[bench]
-    fn named_file_read_10mb(b: &mut Bencher) {
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
-        b.iter(|| {
-            let named_file = CachedFile::from(NamedFile::open(&path_10m).unwrap());
-            named_file.dummy_write()
-        });
-    }
+    // #[bench]
+    // fn named_file_read_10mb(b: &mut Bencher) {
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
+    //     b.iter(|| {
+    //         let named_file = CachedFile::from(NamedFile::open(&path_10m).unwrap());
+    //         named_file.dummy_write()
+    //     });
+    // }
 
-    #[bench]
-    fn cache_get_1mb(b: &mut Bencher) {
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(MEG1 * 20)
-            .build()
-            .unwrap(); //Cache can hold 20Mb
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
-        cache.get(&path_1m); // add the 10 mb file to the cache
+    // #[bench]
+    // fn cache_get_1mb(b: &mut Bencher) {
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(MEG1 * 20)
+    //         .build()
+    //         .unwrap(); //Cache can hold 20Mb
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
+    //     cache.get(&path_1m); // add the 10 mb file to the cache
 
-        b.iter(|| {
-            let cached_file = cache.get(&path_1m);
-            cached_file.dummy_write()
-        });
-    }
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_1m);
+    //         cached_file.dummy_write()
+    //     });
+    // }
 
-    #[bench]
-    fn cache_miss_1mb(b: &mut Bencher) {
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(0)
-            .build()
-            .unwrap();
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
+    // #[bench]
+    // fn cache_miss_1mb(b: &mut Bencher) {
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(0)
+    //         .build()
+    //         .unwrap();
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
 
-        b.iter(|| {
-            let cached_file = cache.get(&path_1m);
-            cached_file.dummy_write()
-        });
-    }
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_1m);
+    //         cached_file.dummy_write()
+    //     });
+    // }
 
-    #[bench]
-    fn named_file_read_1mb(b: &mut Bencher) {
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
+    // #[bench]
+    // fn named_file_read_1mb(b: &mut Bencher) {
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
 
-        b.iter(|| {
-            let named_file = CachedFile::from(NamedFile::open(&path_1m).unwrap());
-            named_file.dummy_write()
-        });
-    }
-
-
-
-    #[bench]
-    fn cache_get_5mb(b: &mut Bencher) {
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(MEG1 * 20)
-            .build()
-            .unwrap();
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
-        cache.get(&path_5m); // add the 10 mb file to the cache
-
-        b.iter(|| {
-            let cached_file = cache.get(&path_5m);
-            cached_file.dummy_write()
-        });
-    }
-
-    #[bench]
-    fn cache_miss_5mb(b: &mut Bencher) {
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(0)
-            .build()
-            .unwrap();
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
-
-        b.iter(|| {
-            let cached_file = cache.get(&path_5m);
-            cached_file.dummy_write()
-        });
-    }
-
-    #[bench]
-    fn named_file_read_5mb(b: &mut Bencher) {
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
-
-        b.iter(|| {
-            let named_file = CachedFile::from(NamedFile::open(&path_5m).unwrap());
-            named_file.dummy_write()
-        });
-    }
+    //     b.iter(|| {
+    //         let named_file = CachedFile::from(NamedFile::open(&path_1m).unwrap());
+    //         named_file.dummy_write()
+    //     });
+    // }
 
 
 
-    // Constant time access regardless of size.
-    #[bench]
-    fn cache_get_1mb_from_1000_entry_cache(b: &mut Bencher) {
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(MEG1 * 3)
-            .build()
-            .unwrap();
-        cache.get(&path_1m); // add the file to the cache
+    // #[bench]
+    // fn cache_get_5mb(b: &mut Bencher) {
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(MEG1 * 20)
+    //         .build()
+    //         .unwrap();
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
+    //     cache.get(&path_5m); // add the 10 mb file to the cache
 
-        // Add 1024 1kib files to the cache.
-        for i in 0..1024 {
-            let path = create_test_file(&temp_dir, 1024, format!("{}_1kib.txt", i).as_str());
-            cache.get(&path);
-        }
-        // make sure that the file has a high priority.
-        cache.alter_all_access_counts(|x| x + 1 * 100000);
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_5m);
+    //         cached_file.dummy_write()
+    //     });
+    // }
 
-        assert_eq!(cache.used_bytes(), MEG1 * 2);
+    // #[bench]
+    // fn cache_miss_5mb(b: &mut Bencher) {
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(0)
+    //         .build()
+    //         .unwrap();
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
 
-        let named_file = CachedFile::from(NamedFile::open(&path_1m).unwrap());
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_5m);
+    //         cached_file.dummy_write()
+    //     });
+    // }
 
-        b.iter(|| {
-            let cached_file = cache.get(&path_1m);
-            assert!(mem::discriminant(&cached_file) != mem::discriminant(&named_file));
-            cached_file.dummy_write()
-        });
-    }
+    // #[bench]
+    // fn named_file_read_5mb(b: &mut Bencher) {
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
 
-    // There is a penalty for missing the cache.
-    #[bench]
-    fn cache_miss_1mb_from_1000_entry_cache(b: &mut Bencher) {
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(MEG1)
-            .build()
-            .unwrap();
-
-        // Add 1024 1kib files to the cache.
-        for i in 0..1024 {
-            let path = create_test_file(&temp_dir, 1024, format!("{}_1kib.txt", i).as_str());
-            cache.get(&path);
-        }
-        // make sure that the file has a high priority.
-        cache.alter_all_access_counts(|x| x + 1 * 100_000_000_000_000_000);
-        let named_file = CachedFile::from(NamedFile::open(&path_1m).unwrap());
-
-        b.iter(|| {
-            let cached_file = cache.get(&path_1m);
-            assert!(mem::discriminant(&cached_file) == mem::discriminant(&named_file)); // get() in this case should only return files in the FS
-            cached_file.dummy_write()
-        });
-    }
-
-    // This is pretty much a worst-case scenario, where every file would try to be removed to make room for the new file.
-    // There is a penalty for missing the cache.
-    #[bench]
-    fn cache_miss_5mb_from_1000_entry_cache(b: &mut Bencher) {
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG1);
-        let cache: Cache = CacheBuilder::new()
-            .size_limit(MEG5)
-            .build()
-            .unwrap();
-
-        // Add 1024 5kib files to the cache.
-        for i in 0..1024 {
-            let path = create_test_file(&temp_dir, 1024 * 5, format!("{}_5kib.txt", i).as_str());
-            cache.get(&path);
-        }
-        // make sure that the file has a high priority.
-        cache.alter_all_access_counts(|x| x + 1 * 100_000_000_000_000_000);
-        let named_file = CachedFile::from(NamedFile::open(&path_5m).unwrap());
-
-        b.iter(|| {
-            let cached_file: CachedFile = cache.get(&path_5m);
-            // Mimic what is done when the response body is set.
-            assert!(mem::discriminant(&cached_file) == mem::discriminant(&named_file));  // get() in this case should only return files in the FS
-            cached_file.dummy_write()
-        });
-    }
+    //     b.iter(|| {
+    //         let named_file = CachedFile::from(NamedFile::open(&path_5m).unwrap());
+    //         named_file.dummy_write()
+    //     });
+    // }
 
 
-    #[bench]
-    fn in_memory_file_read_10mb(b: &mut Bencher) {
-        let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
 
-        b.iter(|| {
-            let in_memory_file = Arc::new(InMemoryFile::open(path_10m.clone()).unwrap());
-            let file: *const InMemoryFile = Arc::into_raw(in_memory_file);
-            unsafe {
-                let _ = (*file).bytes.clone();
-                let _ = Arc::from_raw(file);
-            }
-        });
-    }
+    // // Constant time access regardless of size.
+    // #[bench]
+    // fn cache_get_1mb_from_1000_entry_cache(b: &mut Bencher) {
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(MEG1 * 3)
+    //         .build()
+    //         .unwrap();
+    //     cache.get(&path_1m); // add the file to the cache
+
+    //     // Add 1024 1kib files to the cache.
+    //     for i in 0..1024 {
+    //         let path = create_test_file(&temp_dir, 1024, format!("{}_1kib.txt", i).as_str());
+    //         cache.get(&path);
+    //     }
+    //     // make sure that the file has a high priority.
+    //     cache.alter_all_access_counts(|x| x + 1 * 100000);
+
+    //     assert_eq!(cache.used_bytes(), MEG1 * 2);
+
+    //     let named_file = CachedFile::from(NamedFile::open(&path_1m).unwrap());
+
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_1m);
+    //         assert!(mem::discriminant(&cached_file) != mem::discriminant(&named_file));
+    //         cached_file.dummy_write()
+    //     });
+    // }
+
+    // // There is a penalty for missing the cache.
+    // #[bench]
+    // fn cache_miss_1mb_from_1000_entry_cache(b: &mut Bencher) {
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(MEG1)
+    //         .build()
+    //         .unwrap();
+
+    //     // Add 1024 1kib files to the cache.
+    //     for i in 0..1024 {
+    //         let path = create_test_file(&temp_dir, 1024, format!("{}_1kib.txt", i).as_str());
+    //         cache.get(&path);
+    //     }
+    //     // make sure that the file has a high priority.
+    //     cache.alter_all_access_counts(|x| x + 1 * 100_000_000_000_000_000);
+    //     let named_file = CachedFile::from(NamedFile::open(&path_1m).unwrap());
+
+    //     b.iter(|| {
+    //         let cached_file = cache.get(&path_1m);
+    //         assert!(mem::discriminant(&cached_file) == mem::discriminant(&named_file)); // get() in this case should only return files in the FS
+    //         cached_file.dummy_write()
+    //     });
+    // }
+
+    // // This is pretty much a worst-case scenario, where every file would try to be removed to make room for the new file.
+    // // There is a penalty for missing the cache.
+    // #[bench]
+    // fn cache_miss_5mb_from_1000_entry_cache(b: &mut Bencher) {
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG1);
+    //     let cache: Cache = CacheBuilder::new()
+    //         .size_limit(MEG5)
+    //         .build()
+    //         .unwrap();
+
+    //     // Add 1024 5kib files to the cache.
+    //     for i in 0..1024 {
+    //         let path = create_test_file(&temp_dir, 1024 * 5, format!("{}_5kib.txt", i).as_str());
+    //         cache.get(&path);
+    //     }
+    //     // make sure that the file has a high priority.
+    //     cache.alter_all_access_counts(|x| x + 1 * 100_000_000_000_000_000);
+    //     let named_file = CachedFile::from(NamedFile::open(&path_5m).unwrap());
+
+    //     b.iter(|| {
+    //         let cached_file: CachedFile = cache.get(&path_5m);
+    //         // Mimic what is done when the response body is set.
+    //         assert!(mem::discriminant(&cached_file) == mem::discriminant(&named_file));  // get() in this case should only return files in the FS
+    //         cached_file.dummy_write()
+    //     });
+    // }
 
 
-    #[test]
-    fn file_exceeds_size_limit() {
+    // #[bench]
+    // fn in_memory_file_read_10mb(b: &mut Bencher) {
+    //     let temp_dir = TempDir::new(DIR_TEST).unwrap();
+    //     let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
+
+    //     b.iter(|| {
+    //         let in_memory_file = Arc::new(InMemoryFile::open(path_10m.clone()).unwrap());
+    //         let file: *const InMemoryFile = Arc::into_raw(in_memory_file);
+    //         unsafe {
+    //             let _ = (*file).bytes.clone();
+    //             let _ = Arc::from_raw(file);
+    //         }
+    //     });
+    // }
+
+
+    #[tokio::test]
+    async fn file_exceeds_size_limit() {
         let cache: Cache = CacheBuilder::new()
             .size_limit(MEG1 * 8) // Cache can hold only 8Mb
             .build()
             .unwrap();
         let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10);
+        let path_10m = create_test_file(&temp_dir, MEG10, FILE_MEG10).await;
 
-        let named_file = NamedFile::open(path_10m.clone()).unwrap();
+        let named_file = NamedFile::open(path_10m.clone()).await.unwrap();
 
         // expect the cache to get the item from the FS.
-        assert_eq!(cache.try_insert(path_10m), CachedFile::from(named_file));
+        assert_eq!(cache.try_insert(path_10m).await, CachedFile::from(named_file));
     }
 
 
-    #[test]
-    fn file_replaces_other_file() {
+    #[tokio::test]
+    async fn file_replaces_other_file() {
         let temp_dir = TempDir::new(DIR_TEST).unwrap();
 
-        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
+        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1).await;
+        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5).await;
 
-        let named_file_1m = NamedFile::open(path_1m.clone()).unwrap();
-        let named_file_1m_2 = NamedFile::open(path_1m.clone()).unwrap();
+        let named_file_1m = NamedFile::open(path_1m.clone()).await.unwrap();
+        let named_file_1m_2 = NamedFile::open(path_1m.clone()).await.unwrap();
 
 
-        let mut imf_5m = InMemoryFile::open(path_5m.clone()).unwrap();
-        let mut imf_1m = InMemoryFile::open(path_1m.clone()).unwrap();
+        let mut imf_5m = InMemoryFile::open(path_5m.clone()).await.unwrap();
+        let mut imf_1m = InMemoryFile::open(path_1m.clone()).await.unwrap();
 
         // set expected stats for 5m
         imf_5m.stats.access_count = 1;
@@ -1030,7 +1037,7 @@ mod tests {
 
         assert_eq!(
             cache
-                .try_insert(path_5m.clone())
+                .try_insert(path_5m.clone()).await
                 .get_in_memory_file()
                 .file
                 .as_ref()
@@ -1039,12 +1046,12 @@ mod tests {
         );
         println!("1:\n{:#?}", cache);
         assert_eq!(
-            cache.try_insert(path_1m.clone()),
+            cache.try_insert(path_1m.clone()).await,
             CachedFile::from(named_file_1m)
         );
         println!("2:\n{:#?}", cache);
         assert_eq!(
-            cache.try_insert(path_1m.clone()),
+            cache.try_insert(path_1m.clone()).await,
             CachedFile::from(named_file_1m_2)
         );
         println!("3:\n{:#?}", cache);
@@ -1055,7 +1062,7 @@ mod tests {
 
         assert_eq!(
             cache
-                .try_insert(path_1m.clone())
+                .try_insert(path_1m.clone()).await
                 .get_in_memory_file()
                 .file
                 .as_ref()
@@ -1068,16 +1075,16 @@ mod tests {
 
 
 
-    #[test]
-    fn new_file_replaces_lowest_priority_file() {
+    #[tokio::test]
+    async fn new_file_replaces_lowest_priority_file() {
         let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1);
-        let path_2m = create_test_file(&temp_dir, MEG2, FILE_MEG2);
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
+        let path_1m = create_test_file(&temp_dir, MEG1, FILE_MEG1).await;
+        let path_2m = create_test_file(&temp_dir, MEG2, FILE_MEG2).await;
+        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5).await;
 
 
         #[allow(unused_variables)]
-        let named_file_1m = NamedFile::open(path_1m.clone()).unwrap();
+        let named_file_1m = NamedFile::open(path_1m.clone()).await.unwrap();
 
         let cache: Cache = CacheBuilder::new()
             .size_limit(MEG1 * 7 + 2000) // cache can hold a little more than 7MB
@@ -1085,12 +1092,12 @@ mod tests {
             .unwrap();
 
         println!("1:\n{:#?}", cache);
-        let mut imf_5m: InMemoryFile = InMemoryFile::open(path_5m.clone()).unwrap();
+        let mut imf_5m: InMemoryFile = InMemoryFile::open(path_5m.clone()).await.unwrap();
         imf_5m.stats.priority = 2289;
         imf_5m.stats.access_count = 1;
 
         assert_eq!(
-            cache.get(&path_5m)
+            cache.get(&path_5m).await
                .get_in_memory_file()
                .file
                .as_ref()
@@ -1099,11 +1106,11 @@ mod tests {
         );
 
         println!("2:\n{:#?}", cache);
-        let mut imf_2m: InMemoryFile = InMemoryFile::open(path_2m.clone()).unwrap();
+        let mut imf_2m: InMemoryFile = InMemoryFile::open(path_2m.clone()).await.unwrap();
         imf_2m.stats.priority = 1448;
         imf_2m.stats.access_count = 1;
         assert_eq!(
-            cache.get(&path_2m)
+            cache.get(&path_2m).await
                 .get_in_memory_file()
                 .file
                 .as_ref()
@@ -1113,16 +1120,17 @@ mod tests {
 
 
         println!("3:\n{:#?}", cache);
-        let mut named_1m = NamedFile::open(path_1m.clone()).unwrap();
+        let mut named_1m = NamedFile::open(path_1m.clone()).await.unwrap();
         let mut v: Vec<u8> = Vec::new();
         let _ = cache
-            .get(&path_1m)
+            .get(&path_1m).await
             .get_named_file()
             .read_to_end(&mut v)
+            .await
             .unwrap();
 
         let mut file_vec: Vec<u8> = Vec::new();
-        let _ = named_1m.read_to_end(&mut file_vec);
+        let _ = named_1m.read_to_end(&mut file_vec).await.unwrap();
         assert_eq!(
             v,
             file_vec
@@ -1130,14 +1138,14 @@ mod tests {
 
 
         println!("4:\n{:#?}", cache);
-        let mut imf_1m: InMemoryFile = InMemoryFile::open(path_1m.clone()).unwrap();
+        let mut imf_1m: InMemoryFile = InMemoryFile::open(path_1m.clone()).await.unwrap();
         imf_1m.stats.priority = 2048; // This priority is higher than the in memory file - 2m's 1448, and therefore will replace it now
         imf_1m.stats.access_count = 1;
 
         // The cache will now accept the 1 meg file because (sqrt(2)_size * 1_access) for the old
         // file is less than (sqrt(1)_size * 2_access) for the new file.
         assert_eq!(
-            cache.get(&path_1m)
+            cache.get(&path_1m).await
                 .get_in_memory_file()
                 .file
                 .as_ref()
@@ -1148,17 +1156,17 @@ mod tests {
         println!("5:\n{:#?}", cache);
 
 
-        if let CachedFile::NotFound = cache.get_from_cache(&path_1m) {
+        if let CachedFile::NotFound = cache.get_from_cache(&path_1m).await {
             panic!("Expected 1m file to be in the cache");
         }
 
         // Check if the 5m file is still in the cache
-        if let CachedFile::NotFound = cache.get_from_cache(&path_5m) {
+        if let CachedFile::NotFound = cache.get_from_cache(&path_5m).await {
             panic!("Expected 5m file to be in the cache");
         }
 
         //
-        if let CachedFile::InMemory(_) = cache.get_from_cache(&path_2m) {
+        if let CachedFile::InMemory(_) = cache.get_from_cache(&path_2m).await {
             panic!("Expected 2m file to not be in the cache");
         }
 
@@ -1168,16 +1176,16 @@ mod tests {
 
 
 
-    #[test]
-    fn remove_file() {
+    #[tokio::test]
+    async fn remove_file() {
         let cache: Cache = CacheBuilder::new()
             .size_limit(MEG1 * 10)
             .build()
             .unwrap();
         let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
+        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5).await;
 
-        let mut imf: InMemoryFile = InMemoryFile::open(path_5m.clone()).unwrap();
+        let mut imf: InMemoryFile = InMemoryFile::open(path_5m.clone()).await.unwrap();
 
         // Set the expected values for the stats in IMF.
         imf.stats.priority = 2289;
@@ -1186,7 +1194,7 @@ mod tests {
         // expect the cache to get the item from the FS.
         assert_eq!(
             cache
-                .get(&path_5m)
+                .get(&path_5m).await
                 .get_in_memory_file()
                 .file
                 .as_ref()
@@ -1199,19 +1207,19 @@ mod tests {
         assert_eq!(cache.contains_key(&path_5m.clone()), false);
     }
 
-    #[test]
-    fn refresh_file() {
+    #[tokio::test]
+    async fn refresh_file() {
         let cache: Cache = CacheBuilder::new()
             .size_limit(MEG1 * 10)
             .build()
             .unwrap();
 
         let temp_dir = TempDir::new(DIR_TEST).unwrap();
-        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5);
+        let path_5m = create_test_file(&temp_dir, MEG5, FILE_MEG5).await;
 
 
         assert_eq!(
-            match cache.get(&path_5m) {
+            match cache.get(&path_5m).await {
                 CachedFile::InMemory(c) => c.file.get().stats.size,
                 CachedFile::FileSystem(_) => unreachable!(),
                 CachedFile::NotFound => unreachable!()
@@ -1219,13 +1227,13 @@ mod tests {
             MEG5
         );
 
-        let path_of_file_with_10mb_but_path_name_5m = create_test_file(&temp_dir, MEG10, FILE_MEG5);
+        let path_of_file_with_10mb_but_path_name_5m = create_test_file(&temp_dir, MEG10, FILE_MEG5).await;
 
 
-        cache.refresh(&path_5m);
+        cache.refresh(&path_5m).await;
 
         assert_eq!(
-            match cache.get(&path_of_file_with_10mb_but_path_name_5m) {
+            match cache.get(&path_of_file_with_10mb_but_path_name_5m).await {
                 CachedFile::InMemory(c) => c.file.get().stats.size,
                 CachedFile::FileSystem(_) => unreachable!(),
                 CachedFile::NotFound => unreachable!()

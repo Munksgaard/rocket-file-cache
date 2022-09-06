@@ -1,10 +1,10 @@
 
 use std::path::Path;
-use std::io::BufReader;
-use std::fs::File;
-use std::io;
-use std::io::Read;
+use tokio::io::BufReader;
+use tokio::fs::File;
 use std::fmt;
+use std::io;
+use tokio::io::AsyncReadExt;
 
 
 /// The structure that represents a file in memory.
@@ -31,11 +31,11 @@ impl fmt::Debug for InMemoryFile {
 
 impl InMemoryFile {
     /// Reads the file at the path into an InMemoryFile.
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<InMemoryFile> {
-        let file = File::open(path.as_ref())?;
+    pub async fn open<P: AsRef<Path>>(path: P) -> io::Result<InMemoryFile> {
+        let file = File::open(path.as_ref()).await?;
         let mut reader = BufReader::new(file);
         let mut bytes: Vec<u8> = vec![];
-        let size: usize = reader.read_to_end(&mut bytes)?;
+        let size: usize = reader.read_to_end(&mut bytes).await?;
 
         let stats = FileStats {
             size,

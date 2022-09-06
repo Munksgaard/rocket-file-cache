@@ -1,13 +1,12 @@
 use rocket::response::{Response, Responder};
 use rocket::http::{Status, ContentType};
 use rocket::request::Request;
-use rocket::response::Body;
 
 use std::result;
 use std::sync::Arc;
 use std::path::{PathBuf, Path};
 
-use in_memory_file::InMemoryFile;
+use crate::in_memory_file::InMemoryFile;
 
 use concurrent_hashmap::Accessor;
 
@@ -49,8 +48,8 @@ impl<'a> NamedInMemoryFile<'a> {
 /// extension, convert the `CachedFile` to a `File`, and respond with that instead.
 ///
 /// Based on NamedFile from rocket::response::NamedFile
-impl<'a> Responder<'a> for NamedInMemoryFile<'a> {
-    fn respond_to(self, _: &Request) -> result::Result<Response<'a>, Status> {
+impl<'a> Responder<'a, 'a> for NamedInMemoryFile<'a> {
+    fn respond_to(self, _: &'a Request) -> result::Result<Response<'a>, Status> {
         let mut response = Response::new();
         if let Some(ext) = self.path.extension() {
             if let Some(ct) = ContentType::from_extension(&ext.to_string_lossy()) {
@@ -60,7 +59,7 @@ impl<'a> Responder<'a> for NamedInMemoryFile<'a> {
 
         unsafe {
             let cloned_wrapper: *const Accessor<'a, PathBuf, InMemoryFile> = Arc::into_raw(self.file);
-            response.set_raw_body( Body::Sized((*cloned_wrapper).get().bytes.as_slice(), (*cloned_wrapper).get().stats.size as u64) );
+            response.set_sized_body(Some((*cloned_wrapper).get().stats.size as usize), std::io::Cursor::new((*cloned_wrapper).get().bytes.as_slice()) );
             let _ = Arc::from_raw(cloned_wrapper); // To prevent a memory leak, an Arc needs to be reconstructed from the raw pointer.
         }
 
