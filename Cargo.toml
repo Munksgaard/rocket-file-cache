@@ -26,7 +26,7 @@ maintenance = {status = "passively-maintained"}
 [dependencies]
 rocket = "0.4"
 log = "0.4.6"
-concurrent-hashmap = "0.2.2"
+concurrent-hashmap = { git = "https://github.com/munksgaard/rust-concurrent-hashmap", rev = "1235da7fc89f6dfa3fc14f5ade209771b5632937" }
 
 [dev-dependencies]
 tempdir = "0.3.7"
